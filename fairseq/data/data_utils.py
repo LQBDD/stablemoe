@@ -91,13 +91,7 @@ def load_indexed_dataset(
     datasets = []
     for k in itertools.count():
         path_k = path + (str(k) if k > 0 else "")
-        try:
-            path_k = indexed_dataset.get_indexed_dataset_to_local(path_k)
-        except Exception as e:
-            if "StorageException: [404] Path not found" in str(e):
-                logger.warning(f"path_k: {e} not found")
-            else:
-                raise e
+        path_k = indexed_dataset.get_indexed_dataset_to_local(path_k)
 
         dataset_impl_k = dataset_impl
         if dataset_impl_k is None:
@@ -315,12 +309,13 @@ def batch_by_size(
         )
     except ImportError:
         raise ImportError(
-            "Please build Cython components with: "
-            "`python setup.py build_ext --inplace`"
+            "Please build Cython components with: `pip install --editable .` "
+            "or `python setup.py build_ext --inplace`"
         )
     except ValueError:
         raise ValueError(
-            "Please build (or rebuild) Cython components with `python setup.py build_ext --inplace`."
+            "Please build (or rebuild) Cython components with: `pip install "
+            " --editable .` or `python setup.py build_ext --inplace`."
         )
 
     # added int() to avoid TypeError: an integer is required
@@ -353,7 +348,6 @@ def batch_by_size(
                 max_sentences,
                 bsz_mult,
             )
-
     else:
         fixed_shapes = np.array(fixed_shapes, dtype=np.int64)
         sort_order = np.lexsort(
@@ -373,10 +367,6 @@ def post_process(sentence: str, symbol: str):
         sentence = sentence.replace(" ", "").replace("_", " ").strip()
     elif symbol == "letter":
         sentence = sentence.replace(" ", "").replace("|", " ").strip()
-    elif symbol == "silence":
-        import re
-        sentence = sentence.replace("<SIL>", "")
-        sentence = re.sub(' +', ' ', sentence).strip()
     elif symbol == "_EOW":
         sentence = sentence.replace(" ", "").replace("_EOW", " ").strip()
     elif symbol in {"subword_nmt", "@@ ", "@@"}:
@@ -527,42 +517,15 @@ def get_mem_usage():
         return "N/A"
 
 
-# lens: torch.LongTensor
-# returns: torch.BoolTensor
-def lengths_to_padding_mask(lens):
+def lengths_to_padding_mask(lens: torch.LongTensor) -> torch.BoolTensor:
     bsz, max_lens = lens.size(0), torch.max(lens).item()
     mask = torch.arange(max_lens).to(lens.device).view(1, max_lens)
     mask = mask.expand(bsz, -1) >= lens.view(bsz, 1).expand(-1, max_lens)
     return mask
 
 
-# lens: torch.LongTensor
-# returns: torch.BoolTensor
-def lengths_to_mask(lens):
+def lengths_to_mask(lens: torch.LongTensor) -> torch.BoolTensor:
     return ~lengths_to_padding_mask(lens)
-
-
-def get_buckets(sizes, num_buckets):
-    buckets = np.unique(
-        np.percentile(
-            sizes,
-            np.linspace(0, 100, num_buckets + 1),
-            interpolation='lower',
-        )[1:]
-    )
-    return buckets
-
-
-def get_bucketed_sizes(orig_sizes, buckets):
-    sizes = np.copy(orig_sizes)
-    assert np.min(sizes) >= 0
-    start_val = -1
-    for end_val in buckets:
-        mask = (sizes > start_val) & (sizes <= end_val)
-        sizes[mask] = end_val
-        start_val = end_val
-    return sizes
-
 
 
 def _find_extra_valid_paths(dataset_path: str) -> set:
@@ -583,7 +546,7 @@ def raise_if_valid_subsets_unintentionally_ignored(train_cfg) -> None:
         train_cfg.dataset.ignore_unused_valid_subsets
         or train_cfg.dataset.combine_valid_subsets
         or train_cfg.dataset.disable_validation
-        or not hasattr(train_cfg.task, "data")
+        or getattr(train_cfg.task, "data", None) is None
     ):
         return
     other_paths = _find_extra_valid_paths(train_cfg.task.data)

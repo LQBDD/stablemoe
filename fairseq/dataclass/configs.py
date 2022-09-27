@@ -12,7 +12,6 @@ import torch
 from fairseq.dataclass.constants import (
     DATASET_IMPL_CHOICES,
     DDP_BACKEND_CHOICES,
-    DDP_COMM_HOOK_CHOICES,
     GENERATION_CONSTRAINTS_CHOICES,
     GENERATION_DECODING_FORMAT_CHOICES,
     LOG_FORMAT_CHOICES,
@@ -33,6 +32,9 @@ class FairseqDataclass:
     @staticmethod
     def name():
         return None
+
+    def positional_args(self):
+        return ["data"]
 
     def _get_all_attributes(self) -> List[str]:
         return [k for k in self.__dataclass_fields__.keys()]
@@ -148,31 +150,12 @@ class CommonConfig(FairseqDataclass):
             "help": "pct of updates that can overflow before decreasing the loss scale"
         },
     )
-    on_cpu_convert_precision: bool = field(
-        default=False,
-        metadata={
-            "help": "if set, the floating point conversion to fp16/bf16 runs on CPU. "
-            "This reduces bus transfer time and GPU memory usage."
-        }
-    )
     min_loss_scale: float = field(
         default=1e-4,
-        metadata={"help": "minimum FP16/AMP loss scale, after which training is stopped"},
+        metadata={"help": "minimum FP16 loss scale, after which training is stopped"},
     )
     threshold_loss_scale: Optional[float] = field(
         default=None, metadata={"help": "threshold FP16 loss scale from below"}
-    )
-    amp: bool = field(default=False, metadata={"help": "use automatic mixed precision"})
-    amp_batch_retries: int = field(
-        default=2,
-        metadata={"help": "number of retries of same batch after reducing loss scale with AMP"},
-    )
-    amp_init_scale: int = field(
-        default=2 ** 7, metadata={"help": "default AMP loss scale"}
-    )
-    amp_scale_window: Optional[int] = field(
-        default=None,
-        metadata={"help": "number of updates before increasing AMP loss scale"},
     )
     user_dir: Optional[str] = field(
         default=None,
@@ -219,11 +202,10 @@ class CommonConfig(FairseqDataclass):
             "help": "path to run plasma_store, defaults to /tmp/plasma. Paths outside /tmp tend to fail."
         },
     )
-    # whether to save for each rank
-    save_each_rank: bool = field(
-        default=False,
-        metadata={"help": "if set, independently save model for each rank"},
+    log_nvidia_smi: bool = field(
+        default=False, metadata={"help": "log output from nvidia-smi during training"}
     )
+
 
 @dataclass
 class DistributedTrainingConfig(FairseqDataclass):
@@ -231,12 +213,6 @@ class DistributedTrainingConfig(FairseqDataclass):
         default=max(1, torch.cuda.device_count()),
         metadata={
             "help": "total number of GPUs across all nodes (default: all visible GPUs)"
-        },
-    )
-    distributed_num_procs: Optional[int] = field(
-        default=max(1, torch.cuda.device_count()),
-        metadata={
-            "help": "total number of processes to fork (default: all visible GPUs)"
         },
     )
     distributed_rank: Optional[int] = field(
@@ -273,9 +249,6 @@ class DistributedTrainingConfig(FairseqDataclass):
     )
     ddp_backend: DDP_BACKEND_CHOICES = field(
         default="pytorch_ddp", metadata={"help": "DistributedDataParallel backend"}
-    )
-    ddp_comm_hook: DDP_COMM_HOOK_CHOICES = field(
-        default="none", metadata={"help": "communication hook"}
     )
     bucket_cap_mb: int = field(
         default=25, metadata={"help": "bucket size for reduction"}
@@ -408,8 +381,8 @@ class DistributedTrainingConfig(FairseqDataclass):
     cpu_offload: bool = field(
         default=False, metadata={"help": "offload FP32 params to CPU"}
     )
-    use_sharded_state: bool = field(
-        default=False, metadata={"help": "use sharded checkpoint files"},
+    use_sharded_state: Optional[bool] = field(
+        default=False, metadata={"help": "load and save local state dict"}
     )
 
 
@@ -417,6 +390,9 @@ class DistributedTrainingConfig(FairseqDataclass):
 class DatasetConfig(FairseqDataclass):
     num_workers: int = field(
         default=1, metadata={"help": "how many subprocesses to use for data loading"}
+    )
+    num_workers_valid: int = field(
+        default=0, metadata={"help": "how many subprocesses to use for data loading during validation"}
     )
     skip_invalid_size_inputs_valid_test: bool = field(
         default=False,
@@ -562,7 +538,41 @@ class OptimizationConfig(FairseqDataclass):
             "help": "specify global optimizer for syncing models on different GPUs/shards"
         },
     )
-
+    use_gumbel_softmax: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use Gumbel-Softmax for gate distribution"}
+    )
+    use_gumbel_gates: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use Gumbel-Softmax gates for experts' combination"}
+    )
+    gumbel_decay_scheduler: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Decay the Gumbel Temperature, None/Linear/Exp"}
+    )
+    gumbel_decay_factor: Optional[float] = field(
+        default=1,
+        metadata={
+            "help": "The factor for decay. Such as exp(factor * t) and decay duration for linear"}
+    )    
+    max_temperature: Optional[float] = field(
+        default=1.0,
+        metadata={
+            "help": "Max Gumbel Temperature"}
+    )
+    min_temperature: Optional[float] = field(
+        default=0.5,
+        metadata={
+            "help": "Min the Gumbel Temperature"}
+    )    
+    switch_to_hard_gumbel_softmax: Optional[int] = field(
+        default=-1, #xxx
+        metadata={
+            "help": "Use Hard Gumbel-Softmax for gate distribution aftet xxx iterations"}
+    )
 
 @dataclass
 class CheckpointConfig(FairseqDataclass):
@@ -620,14 +630,6 @@ class CheckpointConfig(FairseqDataclass):
             "help": "keep the last N checkpoints saved with --save-interval-updates"
         },
     )
-    keep_interval_updates_pattern: int = field(
-        default=-1,
-        metadata={
-            "help": "when used with --keep-interval-updates, skips deleting "
-                    "any checkpoints with update X where "
-                    "X %% keep_interval_updates_pattern == 0"
-        },
-    )
     keep_last_epochs: int = field(
         default=-1, metadata={"help": "keep last N epoch checkpoints"}
     )
@@ -643,9 +645,20 @@ class CheckpointConfig(FairseqDataclass):
     no_last_checkpoints: bool = field(
         default=False, metadata={"help": "don't store last checkpoints"}
     )
+    no_best_checkpoints: bool = field(
+        default=False, metadata={"help": "don't store best checkpoints"}
+    )
     no_save_optimizer_state: bool = field(
         default=False,
         metadata={"help": "don't save optimizer-state as part of checkpoint"},
+    )
+    no_save_optimizer_state_on_training_finished: bool = field(
+        default=False,
+        metadata={"help": "don't save optimizer-state as part of checkpoint when training is done"},
+    )
+    symlink_best_and_last_checkpoints: bool = field(
+        default=False,
+        metadata={"help": "Symlink best and last checkpoints instead of copying", "argparse_alias": "--symlink"},
     )
     best_checkpoint_metric: str = field(
         default="loss", metadata={"help": 'metric to use for saving "best" checkpoints'}
@@ -695,7 +708,22 @@ class CheckpointConfig(FairseqDataclass):
             "argparse_alias": "--save-async",
         },
     )
+    s3_upload_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Upload checkpoints asynchronously in a separate "
+                "thread to S3. NOTE: This feature is currently being tested."
+            ),
+            "argparse_alias": "--s3-dir",
+        },
+    )
     model_parallel_size: int = II("common.model_parallel_size")
+    save_trace: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Save the routing trace"}
+    )
 
 
 @dataclass
@@ -929,6 +957,11 @@ class CommonEvalConfig(FairseqDataclass):
     results_path: Optional[str] = field(
         default=None, metadata={"help": "path to save eval results (optional)"}
     )
+    # GShard or Switch model
+    is_moe: bool = field(
+        default=False,
+        metadata={"help": "if set, use distributed init for MoE generation or evaluation"},
+    )
 
 
 @dataclass
@@ -957,6 +990,10 @@ class EvalLMConfig(FairseqDataclass):
             "help": "if BxT is more than this, will batch the softmax over vocab to this amount of tokens, in order to fit into GPU memory"
         },
     )
+    stats_path: Optional[str] = field(default=None, metadata={'argparse_alias': '--sp'})
+    max_valid_steps: Optional[int] = field(default=None, metadata={'help': 'How many batches to evaluate',
+                                                                   "argparse_alias": "--nval"})
+
 
 
 @dataclass

@@ -10,11 +10,10 @@ from argparse import Namespace
 from typing import Any, Callable, Dict, List
 
 import torch
-from fairseq import metrics, search, tokenizer, utils
+from fairseq import metrics, search, tokenizer, utils, distributed_utils
 from fairseq.data import Dictionary, FairseqDataset, data_utils, encoders, iterators
 from fairseq.dataclass import FairseqDataclass
 from fairseq.dataclass.utils import gen_parser_from_dataclass
-from fairseq.optim.amp_optimizer import AMPOptimizer
 from omegaconf import DictConfig
 
 
@@ -211,7 +210,7 @@ class FairseqTask(object):
 
     def get_batch_iterator(
         self,
-        dataset,
+        dataset: FairseqDataset,
         max_tokens=None,
         max_sentences=None,
         max_positions=None,
@@ -224,6 +223,7 @@ class FairseqTask(object):
         epoch=1,
         data_buffer_size=0,
         disable_iterator_cache=False,
+        batch_by_size=True,
     ):
         """
         Get an iterator that yields batches of data from the given dataset.
@@ -256,6 +256,9 @@ class FairseqTask(object):
             disable_iterator_cache (bool, optional): don't cache the
                 EpochBatchIterator (ignores `FairseqTask::can_reuse_epoch_itr`)
                 (default: False).
+            batch_by_size (bool, optional):
+                batch sequences of similar length together to reduce padding.
+                If false, each batch will be of size max_sentences.
         Returns:
             ~fairseq.iterators.EpochBatchIterator: a batched iterator over the
                 given dataset split
@@ -282,14 +285,18 @@ class FairseqTask(object):
                 indices, dataset, max_positions, ignore_invalid_inputs
             )
 
-        # create mini-batches with given size constraints
-        batch_sampler = dataset.batch_by_size(
-            indices,
-            max_tokens=max_tokens,
-            max_sentences=max_sentences,
-            required_batch_size_multiple=required_batch_size_multiple,
-        )
-
+        if batch_by_size:
+            # create mini-batches with given size constraints
+            batch_sampler = dataset.batch_by_size(
+                indices,
+                max_tokens=max_tokens,
+                max_sentences=max_sentences,
+                required_batch_size_multiple=required_batch_size_multiple,
+            )
+        else:
+            assert max_sentences is not None, 'If batch_by_size=False, max_sentences must be passed. Got None'
+            starts = indices[::max_sentences]
+            batch_sampler = [indices[s: s + max_sentences] for s in starts]
         # return a reusable, sharded iterator
         epoch_iter = iterators.EpochBatchIterator(
             dataset=dataset,
@@ -341,38 +348,15 @@ class FairseqTask(object):
         return criterions.build_criterion(cfg, self)
 
     def build_generator(
-        self, models, args, seq_gen_cls=None, extra_gen_cls_kwargs=None, prefix_allowed_tokens_fn=None,
+        self, models, args, seq_gen_cls=None, extra_gen_cls_kwargs=None
     ):
-        """
-        Build a :class:`~fairseq.SequenceGenerator` instance for this
-        task.
-
-        Args:
-            models (List[~fairseq.models.FairseqModel]): ensemble of models
-            args (fairseq.dataclass.configs.GenerationConfig):
-                configuration object (dataclass) for generation
-            extra_gen_cls_kwargs (Dict[str, Any]): extra options to pass
-                through to SequenceGenerator
-            prefix_allowed_tokens_fn (Callable[[int, torch.Tensor], List[int]]):
-                If provided, this function constrains the beam search to
-                allowed tokens only at each step. The provided function
-                should take 2 arguments: the batch ID (`batch_id: int`)
-                and a unidimensional tensor of token ids (`inputs_ids:
-                torch.Tensor`). It has to return a `List[int]` with the
-                allowed tokens for the next generation step conditioned
-                on the previously generated tokens (`inputs_ids`) and
-                the batch ID (`batch_id`). This argument is useful for
-                constrained generation conditioned on the prefix, as
-                described in "Autoregressive Entity Retrieval"
-                (https://arxiv.org/abs/2010.00904) and
-                https://github.com/facebookresearch/GENRE.
-        """
         if getattr(args, "score_reference", False):
             from fairseq.sequence_scorer import SequenceScorer
 
             return SequenceScorer(
                 self.target_dictionary,
                 compute_alignment=getattr(args, "print_alignment", False),
+                compute_vocab_dist=getattr(args, "compute_vocab_dist", False)
             )
 
         from fairseq.sequence_generator import (
@@ -393,8 +377,7 @@ class FairseqTask(object):
         match_source_len = getattr(args, "match_source_len", False)
         diversity_rate = getattr(args, "diversity_rate", -1)
         constrained = getattr(args, "constraints", False)
-        if prefix_allowed_tokens_fn is None:
-            prefix_allowed_tokens_fn = getattr(args, "prefix_allowed_tokens_fn", None)
+        prefix_allowed_tokens_fn = getattr(args, "prefix_allowed_tokens_fn", None)
         if (
             sum(
                 int(cond)
@@ -491,14 +474,14 @@ class FairseqTask(object):
         Returns:
             tuple:
                 - the loss
-                - the sample size, which is used as the denominator for the gradient
+                - the sample size, which is used as the denominator for the
+                  gradient
                 - logging outputs to display while training
         """
         model.train()
         model.set_num_updates(update_num)
         with torch.autograd.profiler.record_function("forward"):
-            with torch.cuda.amp.autocast(enabled=(isinstance(optimizer, AMPOptimizer))):
-                loss, sample_size, logging_output = criterion(model, sample)
+            loss, sample_size, logging_output = criterion(model, sample)
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):

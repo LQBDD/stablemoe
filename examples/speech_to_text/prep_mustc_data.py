@@ -15,7 +15,7 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
-import soundfile as sf
+import torchaudio
 from examples.speech_to_text.data_utils import (
     create_zip,
     extract_fbank_features,
@@ -27,11 +27,9 @@ from examples.speech_to_text.data_utils import (
     save_df_to_tsv,
     cal_gcmvn_stats,
 )
-import torch
+from torch import Tensor
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
-from fairseq.data.audio.audio_utils import get_waveform
 
 
 log = logging.getLogger(__name__)
@@ -73,7 +71,7 @@ class MUSTC(Dataset):
         self.data = []
         for wav_filename, _seg_group in groupby(segments, lambda x: x["wav"]):
             wav_path = wav_root / wav_filename
-            sample_rate = sf.info(wav_path.as_posix()).samplerate
+            sample_rate = torchaudio.info(wav_path.as_posix())[0].rate
             seg_group = sorted(_seg_group, key=lambda x: x["offset"])
             for i, segment in enumerate(seg_group):
                 offset = int(float(segment["offset"]) * sample_rate)
@@ -92,10 +90,9 @@ class MUSTC(Dataset):
                     )
                 )
 
-    def __getitem__(self, n: int) -> Tuple[torch.Tensor, int, str, str, str, str]:
+    def __getitem__(self, n: int) -> Tuple[Tensor, int, str, str, str, str]:
         wav_path, offset, n_frames, sr, src_utt, tgt_utt, spk_id, utt_id = self.data[n]
-        waveform, _ = get_waveform(wav_path, frames=n_frames, start=offset)
-        waveform = torch.from_numpy(waveform)
+        waveform, _ = torchaudio.load(wav_path, offset=offset, num_frames=n_frames)
         return waveform, sr, src_utt, tgt_utt, spk_id, utt_id
 
     def __len__(self) -> int:
@@ -182,7 +179,7 @@ def process(args):
             yaml_filename=f"config_{args.task}.yaml",
             specaugment_policy="lb",
             cmvn_type=args.cmvn_type,
-            gcmvn_path=(
+            gcmvn_cmvn_path=(
                 cur_root / "gcmvn.npz" if args.cmvn_type == "global"
                 else None
             ),

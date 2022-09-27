@@ -17,10 +17,11 @@ from itertools import chain
 
 import numpy as np
 import torch
-from fairseq import checkpoint_utils, options, scoring, tasks, utils
+from fairseq import checkpoint_utils, options, scoring, tasks, utils, distributed_utils, parameter
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.logging import progress_bar
 from fairseq.logging.meters import StopwatchMeter, TimeMeter
+from fairseq.utils import print_r0
 from omegaconf import DictConfig
 
 
@@ -28,7 +29,7 @@ def main(cfg: DictConfig):
 
     if isinstance(cfg, Namespace):
         cfg = convert_namespace_to_omegaconf(cfg)
-
+    parameter.moe_expert_cnt = getattr(cfg.model, "moe_expert_count", 4)
     assert cfg.common_eval.path is not None, "--path required for generation!"
     assert (
         not cfg.generation.sampling or cfg.generation.nbest == cfg.generation.beam
@@ -93,15 +94,30 @@ def _main(cfg: DictConfig, output_file):
 
     # Load ensemble
     logger.info("loading model(s) from {}".format(cfg.common_eval.path))
-    models, saved_cfg = checkpoint_utils.load_model_ensemble(
-        utils.split_paths(cfg.common_eval.path),
+    # if cfg.common_eval.is_moe and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+    #     cfg.checkpoint.checkpoint_suffix = f"-rank-{torch.distributed.get_rank()}"
+    #     moe_freq = 1
+    # else:
+    #     moe_freq = 0
+    # models, saved_cfg = checkpoint_utils.load_model_ensemble(
+    #     utils.split_paths(cfg.common_eval.path),
+    #     arg_overrides=overrides,
+    #     task=task,
+    #     suffix=cfg.checkpoint.checkpoint_suffix,
+    #     strict=(cfg.checkpoint.checkpoint_shard_count == 1),
+    #     num_shards=cfg.checkpoint.checkpoint_shard_count,
+    #     is_moe=moe_freq > 0,
+    # )
+    logger.info("loading model(s) from {}".format(cfg.common_eval.path))
+    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task(
+        [cfg.common_eval.path],
         arg_overrides=overrides,
-        task=task,
         suffix=cfg.checkpoint.checkpoint_suffix,
-        strict=(cfg.checkpoint.checkpoint_shard_count == 1),
-        num_shards=cfg.checkpoint.checkpoint_shard_count,
+        num_shards=1,
+        is_moe=True,
     )
-
+    model = models[0]
+    cfg.common_eval.quiet = True
     # loading the dataset should happen after the checkpoint has been loaded so we can give it the saved task config
     task.load_dataset(cfg.dataset.gen_subset, task_cfg=saved_cfg.task)
 
@@ -138,6 +154,12 @@ def _main(cfg: DictConfig, output_file):
     align_dict = utils.load_align_dict(cfg.generation.replace_unk)
 
     # Load dataset (possibly sharded)
+    num_shards = cfg.distributed_training.distributed_world_size
+    shard_id = cfg.distributed_training.distributed_rank
+    # We need all GPUs to process the same batch
+    if cfg.common_eval.is_moe:
+        num_shards = 1
+        shard_id = 0
     itr = task.get_batch_iterator(
         dataset=task.dataset(cfg.dataset.gen_subset),
         max_tokens=cfg.dataset.max_tokens,
@@ -148,8 +170,8 @@ def _main(cfg: DictConfig, output_file):
         ignore_invalid_inputs=cfg.dataset.skip_invalid_size_inputs_valid_test,
         required_batch_size_multiple=cfg.dataset.required_batch_size_multiple,
         seed=cfg.common.seed,
-        num_shards=cfg.distributed_training.distributed_world_size,
-        shard_id=cfg.distributed_training.distributed_rank,
+        num_shards=num_shards,
+        shard_id=shard_id,
         num_workers=cfg.dataset.num_workers,
         data_buffer_size=cfg.dataset.data_buffer_size,
     ).next_epoch_itr(shuffle=False)
@@ -254,9 +276,9 @@ def _main(cfg: DictConfig, output_file):
 
             if not cfg.common_eval.quiet:
                 if src_dict is not None:
-                    print("S-{}\t{}".format(sample_id, src_str), file=output_file)
+                    print_r0("S-{}\t{}".format(sample_id, src_str), file=output_file)
                 if has_target:
-                    print("T-{}\t{}".format(sample_id, target_str), file=output_file)
+                    print_r0("T-{}\t{}".format(sample_id, target_str), file=output_file)
 
             # Process top predictions
             for j, hypo in enumerate(hypos[i][: cfg.generation.nbest]):
@@ -273,16 +295,16 @@ def _main(cfg: DictConfig, output_file):
                 if not cfg.common_eval.quiet:
                     score = hypo["score"] / math.log(2)  # convert to base 2
                     # original hypothesis (after tokenization and BPE)
-                    print(
+                    print_r0(
                         "H-{}\t{}\t{}".format(sample_id, score, hypo_str),
                         file=output_file,
                     )
                     # detokenized hypothesis
-                    print(
+                    print_r0(
                         "D-{}\t{}\t{}".format(sample_id, score, detok_hypo_str),
                         file=output_file,
                     )
-                    print(
+                    print_r0(
                         "P-{}\t{}".format(
                             sample_id,
                             " ".join(
@@ -299,7 +321,7 @@ def _main(cfg: DictConfig, output_file):
                     )
 
                     if cfg.generation.print_alignment == "hard":
-                        print(
+                        print_r0(
                             "A-{}\t{}".format(
                                 sample_id,
                                 " ".join(
@@ -312,7 +334,7 @@ def _main(cfg: DictConfig, output_file):
                             file=output_file,
                         )
                     if cfg.generation.print_alignment == "soft":
-                        print(
+                        print_r0(
                             "A-{}\t{}".format(
                                 sample_id,
                                 " ".join(
@@ -326,7 +348,7 @@ def _main(cfg: DictConfig, output_file):
                         )
 
                     if cfg.generation.print_step:
-                        print(
+                        print_r0(
                             "I-{}\t{}".format(sample_id, hypo["steps"]),
                             file=output_file,
                         )
@@ -341,7 +363,7 @@ def _main(cfg: DictConfig, output_file):
                                 tgt_dict=tgt_dict,
                                 remove_bpe=None,
                             )
-                            print(
+                            print_r0(
                                 "E-{}_{}\t{}".format(sample_id, step, h_str),
                                 file=output_file,
                             )
@@ -388,7 +410,7 @@ def _main(cfg: DictConfig, output_file):
                     "If you are using BPE on the target side, the BLEU score is computed on BPE tokens, not on proper words.  Use --sacrebleu for standard 13a BLEU tokenization"
                 )
         # use print to be consistent with other main outputs: S-, H-, T-, D- and so on
-        print(
+        print_r0(
             "Generate {} with beam={}: {}".format(
                 cfg.dataset.gen_subset, cfg.generation.beam, scorer.result_string()
             ),
@@ -398,10 +420,13 @@ def _main(cfg: DictConfig, output_file):
     return scorer
 
 
+
+
 def cli_main():
     parser = options.get_generation_parser()
     args = options.parse_args_and_arch(parser)
-    main(args)
+    cfg = convert_namespace_to_omegaconf(args)
+    distributed_utils.call_main(cfg, main)
 
 
 if __name__ == "__main__":
