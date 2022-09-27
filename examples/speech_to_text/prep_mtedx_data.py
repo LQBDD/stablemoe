@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 from typing import Tuple
 
 import pandas as pd
-import soundfile as sf
+import torchaudio
 from examples.speech_to_text.data_utils import (
     create_zip,
     extract_fbank_features,
@@ -25,11 +25,9 @@ from examples.speech_to_text.data_utils import (
     load_df_from_tsv,
     save_df_to_tsv,
 )
-import torch
+from torch import Tensor
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
-from fairseq.data.audio.audio_utils import get_waveform
 
 
 log = logging.getLogger(__name__)
@@ -75,7 +73,7 @@ class mTEDx(Dataset):
         for wav_filename, _seg_group in groupby(segments, lambda x: x["wav"]):
             wav_filename = wav_filename.replace(".wav", ".flac")
             wav_path = wav_root / wav_filename
-            sample_rate = sf.info(wav_path.as_posix()).samplerate
+            sample_rate = torchaudio.info(wav_path.as_posix())[0].rate
             seg_group = sorted(_seg_group, key=lambda x: float(x["offset"]))
             for i, segment in enumerate(seg_group):
                 offset = int(float(segment["offset"]) * sample_rate)
@@ -95,10 +93,9 @@ class mTEDx(Dataset):
                     )
                 )
 
-    def __getitem__(self, n: int) -> Tuple[torch.Tensor, int, str, str, str, str, str]:
+    def __getitem__(self, n: int) -> Tuple[Tensor, int, str, str, str, str, str]:
         wav_path, offset, n_frames, sr, src_utt, tgt_utt, spk_id, tgt_lang, utt_id = self.data[n]
-        waveform, _ = get_waveform(wav_path, frames=n_frames, start=offset)
-        waveform = torch.from_numpy(waveform)
+        waveform, _ = torchaudio.load(wav_path, offset=offset, num_frames=n_frames)
         return waveform, sr, src_utt, tgt_utt, spk_id, tgt_lang, utt_id
 
     def __len__(self) -> int:

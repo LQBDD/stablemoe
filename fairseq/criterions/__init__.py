@@ -11,6 +11,8 @@ from fairseq import registry
 from fairseq.criterions.fairseq_criterion import (  # noqa
     FairseqCriterion,
     LegacyFairseqCriterion,
+    MoECriterion,
+    MoECriterionConfig,
 )
 from omegaconf import DictConfig
 
@@ -30,7 +32,7 @@ def build_criterion(cfg: DictConfig, task):
 
 
 # automatically import any Python files in the criterions/ directory
-for file in sorted(os.listdir(os.path.dirname(__file__))):
+for file in os.listdir(os.path.dirname(__file__)):
     if file.endswith(".py") and not file.startswith("_"):
         file_name = file[: file.find(".py")]
         importlib.import_module("fairseq.criterions." + file_name)

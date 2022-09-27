@@ -68,6 +68,9 @@ class LanguageModelingConfig(FairseqDataclass):
     add_bos_token: bool = field(
         default=False, metadata={"help": "prepend beginning of sentence token (<s>)"}
     )
+    max_source_positions: Optional[int] = field(
+        default=None, metadata={"help": "max number of tokens in the source sequence"}
+    )
     max_target_positions: Optional[int] = field(
         default=None, metadata={"help": "max number of tokens in the target sequence"}
     )
@@ -190,7 +193,7 @@ class LanguageModelingTask(LegacyFairseqTask):
         for target in self.targets:
             if target not in model.supported_targets:
                 raise ValueError(
-                    "Unsupported language modeling target: {}".format(target)
+                    f"Unsupported language modeling target: {target} not in {model.supported_targets}"
                 )
 
         return model
@@ -248,7 +251,6 @@ class LanguageModelingTask(LegacyFairseqTask):
         pad_to_bsz = None
         if self.args.pad_to_fixed_bsz:
             pad_to_bsz = self.args.batch_size_valid if 'valid' in split else self.args.batch_size
-        # print("+++++++++++++++++++++++++++++++++++++++++", pad_to_bsz)
 
         self.datasets[split] = MonolingualDataset(
             dataset=dataset,
@@ -360,16 +362,10 @@ class LanguageModelingTask(LegacyFairseqTask):
             max_tokens=max_tokens,
             max_sentences=batch_size,
             max_positions=max_positions,
-            # ! True -> False
-            # ignore_invalid_inputs=False,
             ignore_invalid_inputs=True,
-            # ! new
-            # required_batch_size_multiple=8,
             num_shards=num_shards,
             shard_id=shard_id,
             num_workers=num_workers,
-            # ! new
-            # epoch=1,
             data_buffer_size=data_buffer_size,
         ).next_epoch_itr(shuffle=False)
 

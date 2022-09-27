@@ -18,7 +18,7 @@ from fairseq.models import (
     register_model,
     register_model_architecture,
 )
-from fairseq.models.transformer import DEFAULT_MIN_PARAMS_TO_WRAP, TransformerEncoder
+from fairseq.models.transformer import TransformerEncoder
 from fairseq.modules import LayerNorm
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
@@ -122,11 +122,6 @@ class RobertaModel(FairseqEncoderModel):
             action="store_true",
             help="(re-)register and load heads when loading checkpoints",
         )
-        parser.add_argument(
-            "--untie-weights-roberta",
-            action="store_true",
-            help="Untie weights between embeddings and classifiers in RoBERTa",
-        )
         # args for "Reducing Transformer Depth on Demand with Structured Dropout" (Fan et al., 2019)
         parser.add_argument(
             "--encoder-layerdrop",
@@ -162,29 +157,46 @@ class RobertaModel(FairseqEncoderModel):
             default=0,
             help="scalar quantization noise and scalar quantization at training time",
         )
-        # args for "Better Fine-Tuning by Reducing Representational Collapse" (Aghajanyan et al. 2020)
+        parser.add_argument(
+            "--untie-weights-roberta",
+            action="store_true",
+            help="Untie weights between embeddings and classifiers in RoBERTa",
+        )
         parser.add_argument(
             "--spectral-norm-classification-head",
             action="store_true",
             default=False,
             help="Apply spectral normalization on the classification head",
         )
-        # args for Fully Sharded Data Parallel (FSDP) training
-        parser.add_argument(
-            "--min-params-to-wrap",
-            type=int,
-            metavar="D",
-            default=DEFAULT_MIN_PARAMS_TO_WRAP,
-            help=(
-                "minimum number of params for a layer to be wrapped with FSDP() when "
-                "training with --ddp-backend=fully_sharded. Smaller values will "
-                "improve memory efficiency, but may make torch.distributed "
-                "communication less efficient due to smaller input sizes. This option "
-                "is set to 0 (i.e., always wrap) when --checkpoint-activations or "
-                "--offload-activations are passed."
-            )
-        )
-
+        parser.add_argument('--moe-freq', type=int, metavar='D', default=0,
+                            help='Frequency at which we insert MoE Transformer layers')
+        parser.add_argument('--moe-expert-count', type=int, metavar='D', default=0,
+                            help='Number of experts in each MoE Layer')
+        parser.add_argument('--moe-gating-use-fp32', default=False, action='store_true',
+                            help="Use FP32 computations in MoE top2 gating function")
+        parser.add_argument('--moe-second-expert-policy', type=str, default='sampling',
+                            help="policy for second expert, options: all/sampling/random")
+        parser.add_argument('--moe-normalize-gate-prob-before-dropping', default=False, action='store_true',
+                            help="whether to normalize gate probs before or after dropping experts for capacity and randomization")
+        parser.add_argument('--moe-expert-ffn-dim', type=int, default=0,
+                            help="MoE Expert FFN dimension")
+        parser.add_argument('--moe-top1-expert', default=False, action='store_true',
+                            help="Use top1 gate instead of top2")
+        parser.add_argument('--moe-eval-capacity-token-fraction', type=float, default=0.25,
+                            help="Fraction of tokens as capacity during validation" + \
+                                 "if set to negative, use same as training. range: (0.0, 1.0].")
+        parser.add_argument('--moe-normalize-expert-grad', type=str, default='world_size',
+                            help="Divide expert gradients by (1) 'world_size' (2) 'sqrt_world_size'")
+        parser.add_argument('--use-moe-pad-mask', default=False, action='store_true',
+                            help="Don't route padding tokens to any expert")
+        # args for pseudo-MoE layers
+        parser.add_argument('--alternate-ffn-embed-dim', type=int, default=0,
+                            help="FFN embed dim of alternate pseudo-MoE blocks")
+        parser.add_argument('--moe-topk-expert', default=False, action='store_true',
+                            help="Use topk gate")
+        parser.add_argument('--topk', type=int, default=-1,
+                            help="k for topk gate")
+        
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
@@ -204,7 +216,7 @@ class RobertaModel(FairseqEncoderModel):
         features_only=False,
         return_all_hiddens=False,
         classification_head_name=None,
-        **kwargs,
+        **kwargs
     ):
         if classification_head_name is not None:
             features_only = True
@@ -259,7 +271,7 @@ class RobertaModel(FairseqEncoderModel):
         checkpoint_file="model.pt",
         data_name_or_path=".",
         bpe="gpt2",
-        **kwargs,
+        **kwargs
     ):
         from fairseq import hub_utils
 
@@ -458,13 +470,16 @@ class RobertaEncoder(FairseqEncoder):
     def build_lm_head(self, embed_dim, output_dim, activation_fn, weight):
         return RobertaLMHead(embed_dim, output_dim, activation_fn, weight)
 
+    def build_lm_head(self, embed_dim, output_dim, activation_fn, weight):
+        return RobertaLMHead(embed_dim, output_dim, activation_fn, weight)
+
     def forward(
         self,
         src_tokens,
         features_only=False,
         return_all_hiddens=False,
         masked_tokens=None,
-        **unused,
+        **unused
     ):
         """
         Args:
@@ -498,7 +513,7 @@ class RobertaEncoder(FairseqEncoder):
         # T x B x C -> B x T x C
         features = encoder_out["encoder_out"][0].transpose(0, 1)
         inner_states = encoder_out["encoder_states"] if return_all_hiddens else None
-        return features, {"inner_states": inner_states}
+        return features, {"inner_states": inner_states, "l_aux": encoder_out['l_aux']}
 
     def output_layer(self, features, masked_tokens=None, **unused):
         return self.lm_head(features, masked_tokens)
@@ -578,5 +593,21 @@ def xlm_architecture(args):
     args.encoder_layers = getattr(args, "encoder_layers", 16)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1280)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 1280 * 4)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
+    base_architecture(args)
+
+@register_model_architecture("roberta", "roberta_xl")
+def roberta_large_architecture(args):
+    args.encoder_layers = getattr(args, "encoder_layers", 48)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1600)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 6400)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 25)
+    base_architecture(args)
+
+@register_model_architecture("roberta", "roberta_large_moe")
+def roberta_large_architecture(args):
+    args.encoder_layers = getattr(args, "encoder_layers", 24)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4096)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
     base_architecture(args)

@@ -140,19 +140,12 @@ class SentencePredictionTask(LegacyFairseqTask):
         def make_dataset(key, dictionary):
             split_path = get_path(key, split)
 
-            try:
-                dataset = data_utils.load_indexed_dataset(
-                    split_path,
-                    dictionary,
-                    self.args.dataset_impl,
-                    combine=combine,
-                )
-            except Exception as e:
-                if "StorageException: [404] Path not found" in str(e):
-                    logger.warning(f"dataset {e} not found")
-                    dataset = None
-                else:
-                    raise e
+            dataset = data_utils.load_indexed_dataset(
+                split_path,
+                dictionary,
+                self.args.dataset_impl,
+                combine=combine,
+            )
             return dataset
 
         input0 = make_dataset("input0", self.source_dictionary)

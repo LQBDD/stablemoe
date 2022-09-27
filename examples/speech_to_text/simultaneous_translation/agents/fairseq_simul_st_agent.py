@@ -10,10 +10,11 @@ from fairseq.file_io import PathManager
 
 try:
     from simuleval import READ_ACTION, WRITE_ACTION, DEFAULT_EOS
-    from simuleval.agents import SpeechAgent
     from simuleval.states import ListEntry, SpeechStates
 except ImportError:
     print("Please install simuleval 'pip install simuleval'")
+
+from torch import nn
 
 SHIFT_SIZE = 10
 WINDOW_SIZE = 25
@@ -64,7 +65,7 @@ class OnlineFeatureExtractor:
 
         input_samples = samples[:effective_num_samples]
         self.previous_residual_samples = samples[
-            num_frames * self.num_samples_per_shift:
+            num_frames * self.num_samples_per_shift :
         ]
 
         torch.manual_seed(1)
@@ -112,12 +113,12 @@ class TensorListEntry(ListEntry):
         }
 
 
-class FairseqSimulSTAgent(SpeechAgent):
+class FairseqSimulSTAgent(nn.Module):
 
     speech_segment_size = 40  # in ms, 4 pooling ratio * 10 ms step size
 
     def __init__(self, args):
-        super().__init__(args)
+        super().__init__()
 
         self.eos = DEFAULT_EOS
 
@@ -138,7 +139,7 @@ class FairseqSimulSTAgent(SpeechAgent):
 
         args.global_cmvn = None
         if args.config:
-            with open(os.path.join(args.data_bin, args.config), "r") as f:
+            with open(args.config, "r") as f:
                 config = yaml.load(f, Loader=yaml.BaseLoader)
 
             if "global_cmvn" in config:
@@ -203,6 +204,9 @@ class FairseqSimulSTAgent(SpeechAgent):
         # fmt: on
         return parser
 
+    def set_up_task(self, task_args):
+        return tasks.setup_task(task_args)
+
     def load_model_vocab(self, args):
 
         filename = args.model_path
@@ -214,14 +218,9 @@ class FairseqSimulSTAgent(SpeechAgent):
         task_args = state["cfg"]["task"]
         task_args.data = args.data_bin
 
-        if args.config is not None:
-            task_args.config_yaml = args.config
-
-        task = tasks.setup_task(task_args)
+        task = self.set_up_task(task_args)
 
         # build model for ensemble
-        state["cfg"]["model"].load_pretrained_encoder_from = None
-        state["cfg"]["model"].load_pretrained_decoder_from = None
         self.model = task.build_model(state["cfg"]["model"])
         self.model.load_state_dict(state["model"], strict=True)
         self.model.eval()
@@ -320,7 +319,7 @@ class FairseqSimulSTAgent(SpeechAgent):
             "tgt": 1 + len(states.units.target),
         }
 
-        states.incremental_states["online"] = {"only": torch.tensor(not states.finish_read())}
+        states.incremental_states["online"] = not states.finish_read()
 
         x, outputs = self.model.decoder.forward(
             prev_output_tokens=tgt_indices,
@@ -334,7 +333,7 @@ class FairseqSimulSTAgent(SpeechAgent):
 
         torch.cuda.empty_cache()
 
-        if outputs.action == 0:
+        if outputs["action"] == 0:
             return READ_ACTION
         else:
             return WRITE_ACTION

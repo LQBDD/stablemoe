@@ -111,9 +111,7 @@ class BARTHubInterface(GeneratorHubInterface):
                 skip_invalid_size_inputs=skip_invalid_size_inputs,
                 **kwargs
             )
-            for id, hypos in zip(batch['id'].tolist(), results):
-                res.append((id, hypos))
-        res = [hypos for _, hypos in sorted(res, key=lambda x: x[0])]
+            res.extend(results)
         return res
 
     def extract_features(

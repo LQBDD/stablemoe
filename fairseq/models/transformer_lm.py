@@ -15,14 +15,14 @@ from fairseq.models import (
     register_model_architecture,
 )
 from fairseq.models.transformer import (
-    DEFAULT_MIN_PARAMS_TO_WRAP, Embedding, TransformerDecoder
+    DEFAULT_MIN_PARAMS_TO_WRAP, Embedding, TransformerDecoder,
 )
 from fairseq.modules import AdaptiveInput, CharacterTokenEmbedder
 from omegaconf import II
 
-
 DEFAULT_MAX_TARGET_POSITIONS = 1024
-
+import logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TransformerLanguageModelConfig(FairseqDataclass):
@@ -180,84 +180,141 @@ class TransformerLanguageModelConfig(FairseqDataclass):
             )
         }
     )
-
-    # config for "MoE Layers"
-    moe_type: Optional[str] = field(
-        default='base_layer', metadata={"help": "what MoE layer to use, can be dense_base_layer, switch_layer, hash_layer, or base_layer"}
-    )
-    moe_layers: Optional[int] = field(
-        default=0, metadata={"help": "number of MoE layers in total"}
-    )
-    moe_sublayers: Optional[int] = field(
-        default=1, metadata={"help": "number of sublayers in each MoE layer"}
-    )
-    train_token_shuffle: Optional[int] = field(
-        default=1, metadata={"help": "shuffle tokens between workers before computing assignment"}
-    )
-    assignment_algorithm: Optional[str] = field(
-        default='BA', metadata={"help": "assignment algorithm to adopt"}
-    )
-    # config for two-stage training and distilled routing model
-    two_stage_updates: Optional[int] = field(
-        default=10000000,
-        metadata={"help": "enter Stage-2 after how many updates"},
-    )
-    distill_assignment: Optional[bool] = field(
-        default=False,
-        metadata={"help": "whether to distill the greedy assignment"},
-    )
-    distilled_model: Optional[str] = field(
-        default='wordemb',
-        metadata={"help": "what model to use for routing"},
-    )
-    # config for decomposed Transformers (if distilled_model == 'trmxl')
-    hf_plm_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "the directory of the hugging face pretrained model"},
-    )
-    vocab_size: Optional[int] = field(
-        default=50261,
-        metadata={"help": "the vocabulary size"},
-    )
-    dict_pad_idx: Optional[int] = field(
-        default=1,
-        metadata={"help": "the pad index in the dictionary"},
-    )
-    dict_bos_idx: Optional[int] = field(
+    # Mixture of Expert Layer arguments
+    alternate_decoder_ffn_embed_dim: int = field(
         default=0,
-        metadata={"help": "the bos index in the dictionary"},
+        metadata={
+            "help": "decoder FFN embed dim of alternate decoder layers"
+        },
     )
-    dict_eos_idx: Optional[int] = field(
-        default=2,
-        metadata={"help": "the eos index in the dictionary"},
+    moe_freq: int = field(
+        default=0,
+        metadata={
+            "help": "Frequency at which we insert MoE Transformer layers"
+        },
     )
-    # config for balance loss
-    balance_loss: Optional[str] = field(
+    moe_expert_count: int = field(
+        default=0,
+        metadata={
+            "help": "Number of experts in each MoE Layer"
+        }
+    )
+    moe_gating_use_fp32: bool = field(
+        default=False,
+        metadata={
+            "help": "Use FP32 computations in MoE top2 gating function"
+        }
+    )
+    moe_second_expert_policy: str = field(
+        default='sampling',
+        metadata={
+            "help": "policy for second expert, options: all/sampling/random"
+        }
+    )
+    moe_normalize_gate_prob_before_dropping: bool = field(
+        default=False,
+        metadata={
+            "help": 'whether to normalize gate probs before or after dropping experts for capacity and randomization'
+        }
+    )
+    moe_expert_ffn_dim: Optional[int] = field(
         default=None,
-        metadata={"help": "which balance auxiliary loss to use"},
+        metadata={
+            "help": "MoE expert FFN dimension"
+        }
     )
-    # config for Hash Layer
-    hash_dict_path: Optional[str] = field(
-        default='/home/v-damaidai/data/unilm/ddm/fairseq_pt/data-bin/hash_dict/hash_dict_8.json',
-        metadata={"help": "the path to the hash dict"},
+    moe_top1_expert: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use top1 gate instead of top2"
+        }
     )
-    # config for Switch Layer
-    capacity_factor: Optional[float] = field(
-        default=100.0,
-        metadata={"help": "capacity factor for Switch Layer"},
+    moe_train_capacity_token_fraction: Optional[float] = field(
+        default=1.0,
+        metadata={
+            "help": "Default: 1.0, Fraction of tokens as capacity during training, if set to negative, use same as training. range: (0.0, 1.0]."
+        }
     )
-    # config for DenseBaseLayer
-    widex: Optional[int] = field(
-        default=1, metadata={"help": "expand FFN width"}
+    moe_eval_capacity_token_fraction: Optional[float] = field(
+        default=0.25,
+        metadata={
+            "help": "Default: 0.25, Fraction of tokens as capacity during validation, if set to negative, use same as training. range: (0.0, 1.0]."
+        }
     )
-    deepx: Optional[int] = field(
-        default=1, metadata={"help": "expand FFN stacked num"}
+    moe_normalize_expert_grad: Optional[str] = field(
+        default='none',
+        metadata={
+            "help": "Divide expert gradients by (1) 'world_size' (2) 'sqrt_world_size' (3) 'none'"
+        }
+    )
+    use_moe_pad_mask: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Don't route padding tokens to any expert",
+        }
+    )
+    record_a2a_perf_stats: Optional[bool] = field(
+        default=False, metadata={"help": "records all to all perf stats during distributed training"}
+    )
+    dummy_a2a: Optional[bool] = field(
+        default=False, metadata={"help": "By passes all to all during distributed training by returning the input buffer as output"}
+    )
+    moe_batch_prioritized_routing: Optional[bool] = field(
+        default=False, metadata={"help": "if true orders token by the gate prob before capacity dropping."}
+    )
+    use_stable_embedding: Optional[bool] = field(
+        default=False,
+        metadata={"help": 'Use bitsandbytes StableEmbeddingLayer which saves embedding state in fp32',
+                  'argparse_alias': "--stable-emb"}
+    )
+    moe_topk_expert: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use topk gate"}
+    )
+    topk: Optional[int] = field(
+        default=-1,
+        metadata={
+            "help": "k for topk gate"
+        }
+    )       
+    # use_gumbel_softmax: Optional[bool] = field(
+    #     default=False,
+    #     metadata={
+    #         "help": "Use Gumbel-Softmax for gate distribution"}
+    # )
+    # gumbel_temperature: Optional[float] = field(
+    #     default=1.0,
+    #     metadata={
+    #         "help": "Non-negative scalar temperature for Gumbel-Softmax"
+    #     }
+    # )       
+    # options from other parts of the config
+
+    # config for "BASE Layers: Simplifying Training of Large, Sparse Models"
+    base_layers: Optional[int] = field(
+        default=0, metadata={"help": "number of BASE layers in total"}
+    )
+    base_sublayers: Optional[int] = field(
+        default=1, metadata={"help": "number of sublayers in each BASE layer"}
+    )
+    base_shuffle: Optional[int] = field(
+        default=1, metadata={"help": "shuffle tokens between workers before computing assignment"}
     )
     # options from other parts of the config
     add_bos_token: bool = II("task.add_bos_token")
     tokens_per_sample: int = II("task.tokens_per_sample")
     max_target_positions: Optional[int] = II("task.max_target_positions")
     tpu: bool = II("common.tpu")
+    memory_efficient_fp16: bool = II("common.memory_efficient_fp16")
+    fp16: bool = II("common.fp16")
+    fp16_no_flatten_grads: bool = II("common.fp16_no_flatten_grads")
+    ddp_backend: str = II("distributed_training.ddp_backend")
+    world_size: int = II("distributed_training.distributed_world_size")
+    distributed_rank: int = II("distributed_training.distributed_rank")
+    batch_size: Optional[int] = II("dataset.batch_size")
+    batch_size_valid: Optional[int] = II("dataset.batch_size_valid")
+
 
 
 @register_model("transformer_lm", dataclass=TransformerLanguageModelConfig)
@@ -345,15 +402,31 @@ class TransformerLanguageModel(FairseqLanguageModel):
             )
             assert args.decoder_input_dim == args.decoder_output_dim
 
+        if (
+            getattr(args, 'moe_freq', 0) > 0
+            and (
+                getattr(args, 'fp16', False)
+                and not getattr(args, 'memory_efficient_fp16', False)
+                and getattr(args, 'ddp_backend', None) != "fully_sharded"
+            )
+        ):
+            assert args.fp16_no_flatten_grads, "If training moe models, set --fp16-no-flatten-grads to calculate correct gradnorm"
+
         decoder = TransformerDecoder(
-            args, task.target_dictionary, embed_tokens, no_encoder_attn=True
+            args, task.target_dictionary, embed_tokens, no_encoder_attn=True,
         )
         return cls(decoder)
 
     @classmethod
     def build_embedding(cls, args, dictionary, embed_dim, path=None):
-        embed_tokens = Embedding(len(dictionary), embed_dim, dictionary.pad())
-        return embed_tokens
+        if getattr(args, 'use_stable_embedding', False):
+            import bitsandbytes as bnb
+            if not args.no_scale_embedding:
+                logger.warning('It is recommended to pass --no-scale-embedding with --use-stable-embedding')
+            return bnb.nn.StableEmbedding(len(dictionary), embed_dim, dictionary.pad())
+
+        else:
+            return Embedding(len(dictionary), embed_dim, dictionary.pad())
 
 
 def base_lm_architecture(args):
@@ -386,9 +459,9 @@ def base_lm_architecture(args):
     args.quant_noise_pq_block_size = getattr(args, "quant_noise_pq_block_size", 8)
     args.quant_noise_scalar = getattr(args, "quant_noise_scalar", 0)
 
-    args.moe_layers = getattr(args, "moe_layers", 0)
-    args.moe_sublayers = getattr(args, "moe_sublayers", 1)
-    args.train_token_shuffle = getattr(args, "train_token_shuffle", False)
+    args.base_layers = getattr(args, "base_layers", 0)
+    args.base_sublayers = getattr(args, "base_sublayers", 1)
+    args.base_shuffle = getattr(args, "base_shuffle", False)
 
     args.add_bos_token = getattr(args, "add_bos_token", False)
     args.no_token_positional_embeddings = getattr(
@@ -399,7 +472,9 @@ def base_lm_architecture(args):
     )
     args.character_embeddings = getattr(args, "character_embeddings", False)
 
-    args.decoder_output_dim = getattr(args, "decoder_output_dim", args.decoder_embed_dim)
+    args.decoder_output_dim = getattr(
+        args, "decoder_output_dim", args.decoder_embed_dim
+    )
     args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
 
     # Model training is not stable without this
@@ -512,7 +587,7 @@ def transformer_lm_gpt2_medium(args):
 def transformer_lm_gpt2_big(args):
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1600)
     args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 6400)
-    args.decoder_layers = getattr(args, "decoder_layers", 48)
+    args.decoder_layers = getattr(args, "decoder_layers", 40)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 25)
     args.dropout = getattr(args, "dropout", 0.1)
     args.attention_dropout = getattr(args, "attention_dropout", 0.1)
@@ -520,60 +595,27 @@ def transformer_lm_gpt2_big(args):
     base_lm_architecture(args)
 
 
-@register_model_architecture("transformer_lm", "transformer_lm_BaseGPT_x1_large")
-def transformer_lm_BaseGPT_x1_large(args):
-    # GPT2
-    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1536)
-    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 6144)
+@register_model_architecture("transformer_lm", "transformer_lm_gpt2_big_wide")
+def transformer_lm_gpt2_big_wide(args):
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 2048)
+    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 8192)
     args.decoder_layers = getattr(args, "decoder_layers", 24)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
-    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
-    args.dropout = getattr(args, "dropout", 0.0)
-    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
-    args.activation_fn = getattr(args, "activation_fn", "relu")
-    # Base Layers
-    args.moe_layers = getattr(args, "moe_layers", 1)
-    args.moe_sublayers = getattr(args, "moe_sublayers", 3)
-    args.train_token_shuffle = getattr(args, "train_token_shuffle", True)
-    # general LM
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 32)
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
     base_lm_architecture(args)
 
 
-@register_model_architecture("transformer_lm", "transformer_lm_BaseGPT_x1_medium")
-def transformer_lm_BaseGPT_x1_medium(args):
-    # GPT2
-    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1024)
-    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
-    args.decoder_layers = getattr(args, "decoder_layers", 24)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
-    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
-    args.dropout = getattr(args, "dropout", 0.0)
-    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
-    args.activation_fn = getattr(args, "activation_fn", "relu")
-    # Base Layers
-    args.moe_layers = getattr(args, "moe_layers", 1)
-    args.moe_sublayers = getattr(args, "moe_sublayers", 6)
-    args.train_token_shuffle = getattr(args, "train_token_shuffle", True)
-    # general LM
-    base_lm_architecture(args)
-
-
-@register_model_architecture("transformer_lm", "transformer_lm_BaseGPT_x1_small")
-def transformer_lm_BaseGPT_x1_small(args):
-    # GPT2
-    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 768)
-    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 3072)
-    args.decoder_layers = getattr(args, "decoder_layers", 12)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 12)
-    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
-    args.dropout = getattr(args, "dropout", 0.0)
-    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
-    args.activation_fn = getattr(args, "activation_fn", "relu")
-    # Base Layers
-    args.moe_layers = getattr(args, "moe_layers", 1)
-    args.moe_sublayers = getattr(args, "moe_sublayers", 3)
-    args.train_token_shuffle = getattr(args, "train_token_shuffle", True)
-    # general LM
+@register_model_architecture("transformer_lm", "transformer_lm_gpt2_bigger")
+def transformer_lm_gpt2_bigger(args):
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 2048)
+    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 8192)
+    args.decoder_layers = getattr(args, "decoder_layers", 48)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 32)
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
     base_lm_architecture(args)
 
 
@@ -660,3 +702,37 @@ def transformer_lm_gpt3_175(args):
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 12288)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 96)
     base_gpt3_architecture(args)
+
+
+@register_model_architecture("transformer_lm", "transformer_lm_gptxl_moe")
+def transformer_lm_gptxl_moe(args):
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1600)
+    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 6400)
+    args.decoder_layers = getattr(args, "decoder_layers", 48)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 25)
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
+    base_lm_architecture(args)
+
+@register_model_architecture("transformer_lm", "transformer_lm_gptmedium_moe")
+def transformer_lm_gptmedium_moe(args):
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1024)
+    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
+    args.decoder_layers = getattr(args, "decoder_layers", 24)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
+    base_lm_architecture(args)
+
+@register_model_architecture("transformer_lm", "transformer_lm_gptsmall_moe")
+def transformer_lm_gpt(args):
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 768)
+    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 3072)
+    args.decoder_layers = getattr(args, "decoder_layers", 12)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 12)
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
+    base_lm_architecture(args)

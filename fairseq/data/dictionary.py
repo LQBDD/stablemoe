@@ -70,7 +70,6 @@ class Dictionary:
         extra_symbols_to_ignore=None,
         unk_string=None,
         include_eos=False,
-        separator=" ",
     ):
         """Helper for converting a tensor of token indices to a string.
 
@@ -97,7 +96,7 @@ class Dictionary:
         if hasattr(self, "bos_index"):
             extra_symbols_to_ignore.add(self.bos())
 
-        sent = separator.join(
+        sent = " ".join(
             token_string(i)
             for i in tensor
             if utils.item(i) not in extra_symbols_to_ignore
@@ -303,20 +302,19 @@ class Dictionary:
         words = line_tokenizer(line)
         if reverse_order:
             words = list(reversed(words))
-        nwords = len(words)
-        ids = torch.IntTensor(nwords + 1 if append_eos else nwords)
+        ids = []
 
-        for i, word in enumerate(words):
+        for word in words:
             if add_if_not_exist:
                 idx = self.add_symbol(word)
             else:
                 idx = self.index(word)
             if consumer is not None:
                 consumer(word, idx)
-            ids[i] = idx
+            ids.append(idx)
         if append_eos:
-            ids[nwords] = self.eos_index
-        return ids
+            ids.append(self.eos_index)
+        return torch.tensor(ids, dtype=torch.int32)
 
     @staticmethod
     def _add_file_to_dictionary_single_worker(

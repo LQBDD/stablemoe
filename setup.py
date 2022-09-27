@@ -8,9 +8,10 @@ import os
 import subprocess
 import sys
 from setuptools import setup, find_packages, Extension
-
 from setuptools import Extension, find_packages, setup
+import site
 
+site.ENABLE_USER_SITE = "--user" in sys.argv[1:]
 
 if sys.version_info < (3, 6):
     sys.exit("Sorry, Python >= 3.6 is required for fairseq.")
@@ -98,17 +99,6 @@ cmdclass = {}
 try:
     # torch is not available when generating docs
     from torch.utils import cpp_extension
-
-    extensions.extend(
-        [
-            cpp_extension.CppExtension(
-                "fairseq.libbase",
-                sources=[
-                    "fairseq/clib/libbase/balanced_assignment.cpp",
-                ],
-            )
-        ]
-    )
 
     extensions.extend(
         [

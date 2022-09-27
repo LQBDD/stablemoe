@@ -12,20 +12,12 @@ import logging
 import math
 import os
 import sys
-import time
 from typing import Dict, Optional, Any, List, Tuple, Callable
-
-# We need to setup root logger before importing any fairseq libraries.
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=os.environ.get("LOGLEVEL", "INFO").upper(),
-    stream=sys.stdout,
-)
-logger = logging.getLogger("fairseq_cli.train")
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import functools
 from fairseq import (
     checkpoint_utils,
     options,
@@ -42,9 +34,17 @@ from fairseq.file_io import PathManager
 from fairseq.logging import meters, metrics, progress_bar
 from fairseq.model_parallel.megatron_trainer import MegatronTrainer
 from fairseq.trainer import Trainer
+from fairseq import parameter
 from omegaconf import DictConfig, OmegaConf
 
 
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=os.environ.get("LOGLEVEL", "INFO").upper(),
+    stream=sys.stdout,
+)
+logger = logging.getLogger("fairseq_cli.train")
 
 
 def main(cfg: FairseqConfig) -> None:
@@ -69,8 +69,10 @@ def main(cfg: FairseqConfig) -> None:
     np.random.seed(cfg.common.seed)
     utils.set_torch_seed(cfg.common.seed)
 
-    if distributed_utils.is_master(cfg.distributed_training):
-        checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
+    checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
+
+    # Print nvidia smi stats
+    logger.info(metrics.get_nvidia_smi_gpu_memory_stats_str())
 
     # Print args
     logger.info(cfg)
@@ -89,31 +91,43 @@ def main(cfg: FairseqConfig) -> None:
     task = tasks.setup_task(cfg.task)
 
     assert cfg.criterion, "Please specify criterion to train a model"
+    if getattr(cfg.model, "moe_freq", 0) > 0 and getattr(cfg.model, "moe_expert_count", 0) < distributed_utils.get_global_world_size():
+        assert cfg.distributed_training.ddp_backend == 'fully_sharded', 'num_experts < num_gpus only supported by FSDP'
 
     # Build model and criterion
     if cfg.distributed_training.ddp_backend == "fully_sharded":
-        with fsdp_enable_wrap(cfg.distributed_training):
+        #if cfg.distributed_training.use_sharded_state: assert cfg.checkpoint.no_save_optimizer_state, f'--use-sharded-state requires --no-save-optimizer-state'
+        extra = {
+            "is_moe": getattr(cfg.model, "moe_freq", 0) > 0,
+            "use_sharded_state": cfg.distributed_training.use_sharded_state,
+        }
+
+        with fsdp_enable_wrap(cfg.distributed_training, **extra):
             model = fsdp_wrap(task.build_model(cfg.model))
     else:
         model = task.build_model(cfg.model)
     criterion = task.build_criterion(cfg.criterion)
+
+    def is_expert_param(p):
+        return getattr(p, "expert", False) or getattr(p, "base_expert", False)
+
     logger.info(model)
     logger.info("task: {}".format(task.__class__.__name__))
     logger.info("model: {}".format(model.__class__.__name__))
     logger.info("criterion: {}".format(criterion.__class__.__name__))
     logger.info(
-        "num. shared model params: {:,} (num. trained: {:,})".format(
-            sum(p.numel() for p in model.parameters() if not getattr(p, "expert", False)),
-            sum(p.numel() for p in model.parameters() if not getattr(p, "expert", False) and p.requires_grad)
+        "num. non-expert model params: {:,} (num. trained: {:,})".format(
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if not is_expert_param(p)),
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if not is_expert_param(p) and p.requires_grad),
         )
     )
-
     logger.info(
-        "num. expert model params: {} (num. trained: {})".format(
-            sum(p.numel() for p in model.parameters() if getattr(p, "expert", False)),
-            sum(p.numel() for p in model.parameters() if getattr(p, "expert", False) and p.requires_grad),
+        "num. expert model params: {:,} (num. trained: {:,})".format(
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if is_expert_param(p)),
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if is_expert_param(p) and p.requires_grad),
         )
     )
+    logger.info(metrics.get_nvidia_smi_gpu_memory_stats_str())
 
     # Load valid dataset (we load training data below, based on the latest checkpoint)
     # We load the valid dataset AFTER building the model
@@ -145,11 +159,12 @@ def main(cfg: FairseqConfig) -> None:
         )
     )
     logger.info(
-        "max tokens per device = {} and max sentences per device = {}".format(
+        "max tokens per GPU = {} and batch size per GPU = {}".format(
             cfg.dataset.max_tokens,
             cfg.dataset.batch_size,
         )
     )
+    logger.info(metrics.get_nvidia_smi_gpu_memory_stats_str())
 
     # Load the latest checkpoint if one is available and restore the
     # corresponding train iterator
@@ -159,13 +174,9 @@ def main(cfg: FairseqConfig) -> None:
         # don't cache epoch iterators for sharded datasets
         disable_iterator_cache=task.has_sharded_data("train"),
     )
-    if cfg.common.tpu:
-        import torch_xla.core.xla_model as xm
-        xm.rendezvous("load_checkpoint")  # wait for all workers
 
     max_epoch = cfg.optimization.max_epoch or math.inf
     lr = trainer.get_lr()
-
     train_meter = meters.StopwatchMeter()
     train_meter.start()
     while epoch_itr.next_epoch_idx <= max_epoch:
@@ -278,12 +289,21 @@ def train(
         ),
     )
     progress.update_config(_flatten_config(cfg))
-
+    if cfg.optimization.use_gumbel_softmax and parameter.gumbel_temperature < 0:
+        parameter.gumbel_temperature = cfg.optimization.max_temperature
+    if cfg.optimization.use_gumbel_gates:
+        parameter.use_gumbel_gates = True
+    parameter.save_dir = cfg.checkpoint.save_dir
+    parameter.save_trace = cfg.checkpoint.save_trace
+    
     trainer.begin_epoch(epoch_itr.epoch)
-
-    valid_subsets = cfg.dataset.valid_subset.split(",")
+    if cfg.task._name in ["multilingual_language_modeling", "translation_multi_simple_epoch"]:
+        valid_subsets = task.args.valid_subset.split(",")
+    else:
+        valid_subsets = cfg.dataset.valid_subset.split(",")
     should_stop = False
     num_updates = trainer.get_num_updates()
+    parameter.num_updates = num_updates
     logger.info("Start iterating over samples")
     for i, samples in enumerate(progress):
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
@@ -294,6 +314,22 @@ def train(
         if log_output is not None:  # not OOM, overflow, ...
             # log mid-epoch stats
             num_updates = trainer.get_num_updates()
+            parameter.num_updates = num_updates
+            if cfg.optimization.use_gumbel_softmax:
+                if cfg.optimization.gumbel_decay_scheduler == "Exp":
+                    import math
+                    # parameter.gumbel_temperature = max(cfg.optimization.max_temperature * math.exp(-0.00001*num_updates),\
+                    #                                     cfg.optimization.min_temperature)
+                    factor = math.log(cfg.optimization.min_temperature/cfg.optimization.max_temperature) / cfg.optimization.gumbel_decay_factor
+                    parameter.gumbel_temperature = max(cfg.optimization.max_temperature * math.exp(factor * num_updates),\
+                                                        cfg.optimization.min_temperature)
+                elif cfg.optimization.gumbel_decay_scheduler == "Linear":
+                    parameter.gumbel_temperature = max(cfg.optimization.max_temperature - num_updates * (cfg.optimization.max_temperature - cfg.optimization.min_temperature)/cfg.optimization.gumbel_decay_factor, \
+                                                        cfg.optimization.min_temperature)
+                
+                if num_updates >= cfg.optimization.switch_to_hard_gumbel_softmax:
+                    parameter.soft_gumbel_training = False
+                    
             if num_updates % cfg.common.log_interval == 0:
                 stats = get_training_stats(metrics.get_smoothed_values("train_inner"))
                 progress.log(stats, tag="train_inner", step=num_updates)
@@ -385,9 +421,7 @@ def validate_and_save(
             and num_updates > 0
             and num_updates % cfg.dataset.validate_interval_updates == 0
         )
-    ) and not cfg.dataset.disable_validation and num_updates >= cfg.dataset.validate_after_updates
-
-    # Validate
+    ) and not cfg.dataset.disable_validation
     valid_losses = [None]
     if do_validate:
         valid_losses = validate(cfg, trainer, task, epoch_itr, valid_subsets)
@@ -397,11 +431,25 @@ def validate_and_save(
     # Save checkpoint
     if do_save or should_stop:
         checkpoint_utils.save_checkpoint(
-            cfg.checkpoint, trainer, epoch_itr, valid_losses[0]
+            cfg.checkpoint, trainer, epoch_itr, valid_losses[0], training_finished=should_stop,
+            async_callback_fn=functools.partial(post_checkpoint_callback, cfg) if cfg.checkpoint.s3_upload_path else None,
         )
 
+    trainer.reset_dummy_batch(epoch_itr.first_batch)
     return valid_losses, should_stop
 
+def post_checkpoint_callback(cfg, filename):
+    if cfg.checkpoint.s3_upload_path is not None:
+        try:
+            # PathManager only supports writing to S3, but this function call
+            # can be replaced with other APIs for copying checkpoints.
+            PathManager.copy_from_local(
+                filename,
+                os.path.join(cfg.checkpoint.s3_upload_path, os.path.basename(filename)),
+                overwrite=True,
+            )
+        except (FileNotFoundError, AssertionError) as e:
+            logger.info(f'could not upload {filename}: {e}')
 
 def get_training_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
     stats["wall"] = round(metrics.get_meter("default", "wall").elapsed_time, 0)
@@ -424,7 +472,8 @@ def validate(
     trainer.begin_valid_epoch(epoch_itr.epoch)
     valid_losses = []
     for subset in subsets:
-        logger.info('begin validation on "{}" subset'.format(subset))
+        logger.info('begin validation on "{}" subset on rank {}'.format(
+            subset, distributed_utils.get_global_rank()))
 
         # Initialize data iterator
         itr = trainer.get_valid_iterator(subset).next_epoch_itr(
@@ -432,6 +481,13 @@ def validate(
         )
         if cfg.common.tpu:
             itr = utils.tpu_data_loader(itr)
+
+        logger.info('got valid iterator on "{}" subset on rank {}'.format(
+                subset,
+                distributed_utils.get_global_rank()
+            )
+        )
+
         progress = progress_bar.progress_bar(
             itr,
             log_format=cfg.common.log_format,
@@ -454,6 +510,8 @@ def validate(
             ),
         )
 
+        logger.info('Begin looping over validation "{}" subset with length "{}"'.format(subset, len(progress)))
+
         # create a new root metrics aggregator so validation metrics
         # don't pollute other aggregators (e.g., train meters)
         with metrics.aggregate(new_root=True) as agg:
@@ -464,13 +522,50 @@ def validate(
 
         # log validation stats
         stats = get_valid_stats(cfg, trainer, agg.get_smoothed_values())
-
-        if hasattr(task, "post_validate"):
-            task.post_validate(trainer.get_model(), stats, agg)
-
         progress.print(stats, tag=subset, step=trainer.get_num_updates())
-
         valid_losses.append(stats[cfg.checkpoint.best_checkpoint_metric])
+        # if cfg.model.moe_topk_expert:
+        #     # Initialize data iterator
+        #     itr = trainer.get_valid_iterator(subset).next_epoch_itr(
+        #         shuffle=False, set_dataset_epoch=False  # use a fixed valid set
+        #     )
+        #     if cfg.common.tpu:
+        #         itr = utils.tpu_data_loader(itr)
+            
+        #     progress = progress_bar.progress_bar(
+        #         itr,
+        #         log_format=cfg.common.log_format,
+        #         log_interval=cfg.common.log_interval,
+        #         epoch=epoch_itr.epoch,
+        #         prefix=f"valid on '{subset}' subset",
+        #         tensorboard_logdir=(
+        #             cfg.common.tensorboard_logdir
+        #             if distributed_utils.is_master(cfg.distributed_training)
+        #             else None
+        #         ),
+        #         default_log_format=("tqdm" if not cfg.common.no_progress_bar else "simple"),
+        #         wandb_project=(
+        #             cfg.common.wandb_project
+        #             if distributed_utils.is_master(cfg.distributed_training)
+        #             else None
+        #         ),
+        #         wandb_run_name=os.environ.get(
+        #             "WANDB_NAME", os.path.basename(cfg.checkpoint.save_dir)
+        #         ),
+        #     )
+
+        #     #*******************************************Validation Dense Model**********************************************************
+        #     parameter.dense_validate = True
+        #     with metrics.aggregate(new_root=True) as agg:
+        #         for i, sample in enumerate(progress):
+        #             if cfg.dataset.max_valid_steps is not None and i > cfg.dataset.max_valid_steps:
+        #                 break
+        #             trainer.valid_step(sample)
+        #     # log validation stats
+        #     stats = get_valid_stats(cfg, trainer, agg.get_smoothed_values())
+        #     progress.print(stats, tag="validate_dense", step=trainer.get_num_updates())
+        #     parameter.dense_validate = False
+        #     #*************************************************************************************************************************
     return valid_losses
 
 

@@ -349,6 +349,9 @@ class TensorboardProgressBarWrapper(BaseProgressBar):
             _writers[key].add_text("sys.argv", " ".join(sys.argv))
         return _writers[key]
 
+    def __len__(self):
+        return len(self.wrapped_bar)
+
     def __iter__(self):
         return iter(self.wrapped_bar)
 
@@ -478,13 +481,13 @@ class AzureMLProgressBarWrapper(BaseProgressBar):
         if Run is None:
             return
         if step is None:
-            step = stats["num_updates"]
+            step = stats['num_updates']
 
-        prefix = "" if tag is None else tag + "/"
+        prefix = '' if tag is None else tag + '/'
 
-        for key in stats.keys() - {"num_updates"}:
+        for key in stats.keys() - {'num_updates'}:
             name = prefix + key
             if isinstance(stats[key], AverageMeter):
-                self.run.log_row(name=name, **{"step": step, key: stats[key].val})
+                self.run.log_row(name=name, **{'step': step, key: stats[key].val})
             elif isinstance(stats[key], Number):
-                self.run.log_row(name=name, **{"step": step, key: stats[key]})
+                self.run.log_row(name=name, **{'step': step, key: stats[key]})
